@@ -1,0 +1,4 @@
+[submodule "third_party/PhysTwinFork"]
+	path = third_party/PhysTwinFork
+	url = git@github.com:Qiandao-Liu/PhysTwinFork.git
+	branch = qiandao/main

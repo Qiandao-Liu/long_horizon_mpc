@@ -5,4 +5,11 @@ __pycache__/
 *.log
 experiments/
 
-.vscode
+.DS_Store
+
+__pycache__/
+*.pyc
+*.pyo
+
+.vscode/
+.idea/

@@ -1,4 +1,4 @@
-# /workspace/src/env/phystwin_env.py
+# /src/env/phystwin_env.py
 import numpy as np
 import warp as wp
 wp.config.mode = "debug"
@@ -12,29 +12,40 @@ import imageio
 import math
 import open3d as o3d
 from tqdm import trange
-from PhysTwin.qqtt.engine.trainer_warp import InvPhyTrainerWarp
-import PhysTwin.qqtt.model.diff_simulator.spring_mass_warp as smw
-from PhysTwin.qqtt.utils import logger, cfg
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import KMeans
 
-from PhysTwin.gaussian_splatting.scene.gaussian_model import GaussianModel
-from PhysTwin.gaussian_splatting.scene.cameras import Camera
-from PhysTwin.gaussian_splatting.gaussian_renderer import render as render_gaussian
-from PhysTwin.gaussian_splatting.dynamic_utils import (
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # src/env/phystwin_env.py
+SRC_DIR      = PROJECT_ROOT / "src"
+PHYSTWIN_DIR = PROJECT_ROOT / "third_party" / "PhysTwinFork"
+DATA_DIR     = PROJECT_ROOT / "data"
+
+import sys
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+if str(PHYSTWIN_DIR) not in sys.path:
+    sys.path.insert(0, str(PHYSTWIN_DIR))
+
+from qqtt.engine.trainer_warp import InvPhyTrainerWarp
+import qqtt.model.diff_simulator.spring_mass_warp as smw
+from qqtt.utils import logger, cfg
+
+from gaussian_splatting.scene.gaussian_model import GaussianModel
+from gaussian_splatting.scene.cameras import Camera
+from gaussian_splatting.gaussian_renderer import render as render_gaussian
+from gaussian_splatting.dynamic_utils import (
     interpolate_motions_speedup,
     knn_weights,
     knn_weights_sparse,
     get_topk_indices,
     calc_weights_vals_from_indices,
 )
-from PhysTwin.gaussian_splatting.utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
-from PhysTwin.gs_render import (
+from gaussian_splatting.utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+from gs_render import (
     remove_gaussians_with_low_opacity,
     remove_gaussians_with_point_mesh_distance,
 )
-from PhysTwin.gaussian_splatting.rotation_utils import quaternion_multiply, matrix_to_quaternion
-from sklearn.cluster import KMeans
-
+from gaussian_splatting.rotation_utils import quaternion_multiply, matrix_to_quaternion
 
 class PhysTwinEnv():
     """

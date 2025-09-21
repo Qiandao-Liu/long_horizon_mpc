@@ -1,12 +1,19 @@
-# workspace/src/planning/gradient_mpc.py
 import os, sys, pickle, math, time
 import torch
+import warp as wp
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../PhysTwin")))
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # src/planning/gradient_mpc.py
+SRC_DIR      = PROJECT_ROOT / "src"
+PHYSTWIN_DIR = PROJECT_ROOT / "third_party" / "PhysTwinFork"
+DATA_DIR     = PROJECT_ROOT / "data"
+
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+if str(PHYSTWIN_DIR) not in sys.path:
+    sys.path.insert(0, str(PHYSTWIN_DIR))
 
 from src.env.phystwin_env import PhysTwinEnv
-import warp as wp
 
 @torch.no_grad()
 def _export_state_for_outer(sim):
@@ -58,95 +65,6 @@ def _build_eval_env(case_name, base_state, target_data, left_idx, right_idx):
 
     return env, sim, left_wp_mask, right_wp_mask
 
-# 可视化 & 保存可视化
-def _wp_vec3_to_torch(wp_arr):
-    # wp.array(vec3) -> torch.float32 [N,3] (cuda) -> cpu
-    return wp.to_torch(wp_arr).detach().cpu()
-
-# 可视化 & 保存可视化
-@torch.no_grad()
-def debug_visualize_rollout(case_name, base_state, target_data, left_idx, right_idx,
-                            action_seq, max_delta=None, tag="debug"):
-    """
-    纯前向 roll 出 horizon 步，保存：
-      - frames:        每步后的 cloth 点云 [T, N, 3]
-      - ctrl_frames:   每步控制点的轨迹    [T, C, 3]  （按「命令的增量」累积得到）
-      - a_full_all:    每步展开后的 full 控制场 [H, C, 3]
-      - a0, a0_full, scale, left_idx, right_idx 供可视化
-    """
-    import numpy as np
-    os.makedirs("PhysTwin/mpc_logs", exist_ok=True)
-
-    # 1) 重建 eval_env
-    env, sim, lm, rm = _build_eval_env(case_name, base_state, target_data, left_idx, right_idx)
-    scale = getattr(sim, "MAX_DELTA", 1e-5) if max_delta is None else float(max_delta)
-
-    # 2) 组动作（纯前向）
-    a_seq_wp = wp.from_torch(action_seq, dtype=wp.vec3, requires_grad=False)
-    horizon = action_seq.shape[0] // 2
-
-    action_slice = []
-    for j in range(horizon):
-        dlr = wp.zeros(2, dtype=wp.vec3, device="cuda", requires_grad=False)
-        wp.launch(sim.copy_row_vec3, dim=2, inputs=[a_seq_wp, j, 2], outputs=[dlr])
-
-        df = wp.zeros(sim.num_control_points, dtype=wp.vec3, device="cuda", requires_grad=False)
-        wp.launch(sim.expand_row2_squash_scale, dim=sim.num_control_points,
-                  inputs=[dlr, lm, rm, scale], outputs=[df])
-        action_slice.append(df)
-
-    # 3) 布料点云轨迹
-    frames = []
-    # 初始帧：start-of-rollout 的起点（保持读取 [0]）
-    frames.append(_wp_vec3_to_torch(sim.wp_states[0].wp_x).numpy())
-
-    for j in range(horizon):
-        sim.one_step_from_action(action_slice[j], is_first_step=(j == 0))
-        # ⬇️ 关键改动：记录“本步的结果”，即 [-1]
-        frames.append(_wp_vec3_to_torch(sim.wp_states[-1].wp_x).numpy())
-
-    # 4) 控制点轨迹（按命令的 full 控制场累积）
-    #    初始控制点 = base_state["ctrl_pts"]，每一步加 action_slice[j]
-    ctrl0 = torch.tensor(base_state["ctrl_pts"], dtype=torch.float32).cpu().numpy()  # [C,3]
-    a_full_all = [ _wp_vec3_to_torch(df).numpy() for df in action_slice ]            # H × [C,3]
-    ctrl_frames = [ctrl0.copy()]
-    acc = ctrl0.copy()
-    for j in range(horizon):
-        acc = acc + a_full_all[j]
-        ctrl_frames.append(acc.copy())
-    ctrl_frames = np.asarray(ctrl_frames, dtype=np.float32)   # [H+1, C, 3]
-    a_full_all = np.asarray(a_full_all, dtype=np.float32)     # [H, C, 3]
-
-    # 5) 位移统计（cloth）
-    disp_mean, disp_max = [], []
-    for t in range(1, len(frames)):
-        d = frames[t] - frames[t-1]
-        n = np.linalg.norm(d, axis=1)
-        disp_mean.append(float(n.mean()))
-        disp_max.append(float(n.max()))
-
-    # 6) 也存下第一步信息
-    a0 = action_seq[0:2].detach().cpu().numpy()
-    a0_full = _wp_vec3_to_torch(action_slice[0]).numpy()
-
-    out_path = os.path.join("PhysTwin", "mpc_logs", f"debug_{tag}.npz")
-    np.savez_compressed(
-        out_path,
-        frames=np.asarray(frames, dtype=np.float32),        # [H+1, N, 3]
-        ctrl_frames=ctrl_frames,                            # [H+1, C, 3]
-        a_full_all=a_full_all,                              # [H,   C, 3]
-        disp_mean=np.asarray(disp_mean, dtype=np.float32),
-        disp_max=np.asarray(disp_max, dtype=np.float32),
-        action_seq=action_seq.detach().cpu().numpy(),       # [H*2, 3]
-        a0=a0, a0_full=a0_full,
-        scale=float(scale),
-        left_idx=np.asarray(left_idx, dtype=np.int32),
-        right_idx=np.asarray(right_idx, dtype=np.int32),
-    )
-    print(f"[DEBUG-VIS] saved {out_path} | "
-          f"cloth disp_mean[0..4]={disp_mean[:5]} | disp_max[0..4]={disp_max[:5]}")
-
-
 def main(
     case_name="double_lift_cloth_1",
     init_idx=1,
@@ -160,8 +78,8 @@ def main(
     max_delta=None,   # 如果 None 就用 sim.MAX_DELTA
 ):
     # 1) 载入数据
-    init_path   = f"PhysTwin/mpc_init/init_{init_idx:03d}.pkl"
-    target_path = f"PhysTwin/mpc_target_U/target_{target_idx:03d}.pkl"
+    init_path   = DATA_DIR / "mpc_init"   / f"init_{init_idx:03d}.pkl"
+    target_path = DATA_DIR / "mpc_target" / f"target_{target_idx:03d}.pkl"
     with open(init_path, "rb") as f:
         init_data = pickle.load(f)
     with open(target_path, "rb") as f:
@@ -287,13 +205,6 @@ def main(
             # 早停
             if loss_val < early_tol:
                 print(f"[STAT-MPC] 🎉 Early stop at outer={outer:03d} it={it:03d}, loss={loss_val:.6f} < {early_tol}")
-                # 最后可视化一次
-                with torch.no_grad():
-                    debug_visualize_rollout(
-                        case_name, base_state, target_data, left_idx, right_idx,
-                        action_seq=action_seq, max_delta=max_delta,
-                        tag=f"earlystop_outer{outer:03d}_it{it:03d}"
-                    )
                 early_stop = True
                 break
 
@@ -330,14 +241,6 @@ def main(
                     f"[STAT-MPC] outer={outer:03d} it={it:03d} "
                     f"loss={loss_val:.12f} re_eval={re_eval_loss:.12f} "
                     f"|Δact|={act_norm:.3e} grad_norm={gnorm:.3e}"
-                )
-
-            # 可视化
-            if (it % 8) == 0:
-                debug_visualize_rollout(
-                    case_name, base_state, target_data, left_idx, right_idx,
-                    action_seq=action_seq, max_delta=max_delta,
-                    tag=f"outer{outer:03d}_it{it:03d}"
                 )
 
             # 释放评估 env，防止显存堆积

@@ -89,11 +89,9 @@ def split_ctrl_pts_dbscan(ctrl_pts: np.ndarray):
 
     clusters = {}
     for i in range(max(labels) + 1):
-        clusters[i] = np.where(labels == i)[0]  # 保存索引而不是值
-
+        clusters[i] = np.where(labels == i)[0]
     if len(clusters) != 2:
         print(f"⚠️ Warning: DBSCAN did not find exactly 2 clusters! Found {len(clusters)}")
-        # fallback: 左右各取一半
         return np.arange(15), np.arange(15, 30)
 
     c0_mean_x = ctrl_pts[clusters[0], 0].mean()
@@ -106,7 +104,6 @@ def split_ctrl_pts_dbscan(ctrl_pts: np.ndarray):
 
     return left_idx, right_idx
 
-# 加载数据
 with open("./mpc_init/init_000.pkl", "rb") as f:
     data = pickle.load(f)
 

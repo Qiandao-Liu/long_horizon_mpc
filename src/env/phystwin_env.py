@@ -82,8 +82,8 @@ class PhysTwinEnv():
         # ===== 3. Init TrainerWarp & SimulatorWarp =====
         cfg.device = torch.device("cuda:0")
         trainer = InvPhyTrainerWarp(
-            data_path=data_path,
-            base_dir=base_dir,
+            data_path=str(data_path),
+            base_dir=str(base_dir),
             pure_inference_mode=pure_inference_mode
         )
 

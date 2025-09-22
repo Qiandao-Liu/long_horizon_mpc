@@ -7,7 +7,7 @@ import cv2
 import matplotlib.pyplot as plt
 
 """
-python scripts/visualize_demo.py \
+python src/utils/visualize_demo.py \
   --pkl /home/qiandaoliu/long_horizon_mpc/data/tasks/task7/demo_rollout/demo.pkl \
   --out /home/qiandaoliu/long_horizon_mpc/data/tasks/task7/demo_rollout \
   --fps 30 \
@@ -15,6 +15,7 @@ python scripts/visualize_demo.py \
 """
 
 """
+Structure of a .pkl Rollout:
 {
     "ctrl_seq": [
         np.ndarray shape (C,3), # frame 0

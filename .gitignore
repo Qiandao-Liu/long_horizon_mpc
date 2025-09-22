@@ -16,3 +16,5 @@ __pycache__/
 
 .data/
 data/
+
+third_party/

@@ -1,0 +1,13 @@
+<!-- /assets/mujoco/scene/ur5e_room.xml -->
+<mujoco model="ur5e_room">
+  <!-- 解析时，会把下面 include 展开并合并 -->
+  <include file="${UR5E_XML}"/>
+
+  <option timestep="0.005" gravity="0 0 -9.81" integrator="RK4"/>
+  <size njmax="3000" nconmax="300"/>
+
+  <worldbody>
+    <geom name="floor" type="plane" size="4 4 0.1" rgba="0.9 0.9 0.9 1"/>
+
+  </worldbody>
+</mujoco>

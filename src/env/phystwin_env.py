@@ -172,7 +172,7 @@ class PhysTwinEnv():
 
         if len(clusters) != 2:
             print(f"Warning: DBSCAN did not find exactly 2 clusters! Found {len(clusters)}")
-            return np.arange(15), np.arange(15, 30)  # half-half
+            return np.arange(15), np.arange(15, 30)  # half-half 
 
         ctrl_np = ctrl_pts.cpu().numpy()
         c0_mean_x = ctrl_np[clusters[0], 0].mean()

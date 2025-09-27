@@ -15,7 +15,7 @@ python src/utils/visualize_demo.py \
 """
 
 """
-Structure of a .pkl Rollout:
+Structure of a demo.pkl Rollout:
 {
     "ctrl_seq": [
         np.ndarray shape (C,3), # frame 0

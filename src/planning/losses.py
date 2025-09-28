@@ -34,7 +34,7 @@ def mpc_loss_shape_relative(sim, springs_wp, w_action=0.0, action_seq_wp=None):
     - springs_wp: M*2 的 warp int32 数组 同拓扑
     """
     # 边长项
-    M = springs_wp.shape[0]
+    M = springs_wp.shape[0] // 2
     invM = 1.0 / float(M)
     out = wp.zeros(1, dtype=wp.float32, device="cuda", requires_grad=True)
     wp.launch(edge_length_mse, dim=M,

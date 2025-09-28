@@ -32,7 +32,7 @@ class MPCOpts:
     w_action: float = 0.0
     early_tol: float = 1e-3
 
-class MPCRunner:
+class GradientCore:
     def __init__(self, case_name: str, data_dir: Path, device="cuda"):
         self.case = case_name
         self.data_dir = Path(data_dir)
@@ -42,53 +42,48 @@ class MPCRunner:
         self.sim = self.env.simulator
 
         # 左右 mask
-        init_ctrl = torch.zeros(self.sim.num_control_points, 3, device="cuda")
-        L, R = self.env.split_ctrl_pts_dbscan(init_ctrl)
-        self.left_idx, self.right_idx = L, R
-        left_mask  = torch.zeros(self.sim.num_control_points, dtype=torch.int32, device="cuda")
-        right_mask = torch.zeros_like(left_mask)
-        left_mask[L] = 1; right_mask[R] = 1
-        self.left_wp_mask  = wp.array(left_mask.detach().cpu().numpy(), dtype=wp.int32, device="cuda")
-        self.right_wp_mask = wp.array(right_mask.detach().cpu().numpy(), dtype=wp.int32, device="cuda")
+        self.left_idx = None
+        self.right_idx = None
+        self.left_wp_mask = None
+        self.right_wp_mask = None
 
         # 预备 springs（来自 init.pkl）
         self.springs_wp = None
 
     def set_init_from_pkl(self, init_pkl: dict):
+        # 写入初始状态
         wp_x0 = wp.array(init_pkl["wp_x"], dtype=wp.vec3f, device="cuda", requires_grad=True)
         wp_v0 = wp.array(init_pkl["wp_v"], dtype=wp.vec3f, device="cuda", requires_grad=True)
         self.sim.set_init_state(wp_x0, wp_v0)
 
-        init_ctrl = torch.tensor(init_pkl["ctrl_pts"], dtype=torch.float32, device="cuda")
-        self.sim.wp_original_control_point = wp.from_torch(init_ctrl, dtype=wp.vec3, requires_grad=False)
+        ctrl = torch.tensor(init_pkl["ctrl_pts"], dtype=torch.float32, device="cuda")
+        self.sim.wp_original_control_point = wp.from_torch(ctrl, dtype=wp.vec3, requires_grad=False)
         self.sim.wp_target_control_point   = wp.clone(self.sim.wp_original_control_point, requires_grad=True)
 
-        # springs（M,2）到 warp
+        # 弹簧
         springs_np = init_pkl.get("spring_indices", None)
-        if springs_np is not None:
-            self.springs_wp = wp.array(springs_np.reshape(-1).astype(np.int32), dtype=wp.int32, device="cuda")
-        else:
+        if springs_np is None:
             raise ValueError("init_pkl missing 'spring_indices'")
+        self.springs_wp = wp.array(springs_np.reshape(-1).astype(np.int32), dtype=wp.int32, device="cuda")
+
+        # —— 左右分组（使用真实 ctrl）——
+        L, R = self.env.split_ctrl_pts_kmeans(ctrl)
+        if not isinstance(L, (list, tuple)) or len(L) == 0 or len(R) == 0:
+            raise RuntimeError("KMeans returned empty cluster(s)")
+
+        self.left_idx, self.right_idx = L.detach().cpu().numpy(), R.detach().cpu().numpy()
+
+        # 构建/更新 warp mask
+        left_mask  = torch.zeros(ctrl.shape[0], dtype=torch.int32, device="cuda")
+        right_mask = torch.zeros_like(left_mask)
+        left_mask[L] = 1; right_mask[R] = 1
+        self.left_wp_mask  = wp.array(left_mask.detach().cpu().numpy(), dtype=wp.int32, device="cuda")
+        self.right_wp_mask = wp.array(right_mask.detach().cpu().numpy(), dtype=wp.int32, device="cuda")
+
 
     def set_target_from_pkl(self, target_pkl: dict):
         target_gs = torch.tensor(target_pkl["object_points"], dtype=torch.float32, device="cuda")
         self.sim.wp_current_object_points = wp.from_torch(target_gs, dtype=wp.vec3, requires_grad=False)
-
-        # 可见性/motion-valid 兜底
-        if not hasattr(self.sim, "wp_current_object_visibilities") or self.sim.wp_current_object_visibilities is None:
-            num_surface = target_gs.shape[0]
-            self.sim.wp_current_object_visibilities = wp.array(
-                torch.ones(num_surface, dtype=torch.int32, device="cuda").cpu().numpy(),
-                dtype=wp.int32, device="cuda"
-            )
-            self.sim.num_valid_visibilities = int(num_surface)
-        if not hasattr(self.sim, "wp_current_object_motions_valid") or self.sim.wp_current_object_motions_valid is None:
-            num_orig = getattr(self.sim, "num_original_points", target_gs.shape[0])
-            self.sim.wp_current_object_motions_valid = wp.array(
-                torch.ones(num_orig, dtype=torch.int32, device="cuda").cpu().numpy(),
-                dtype=wp.int32, device="cuda"
-            )
-            self.sim.num_valid_motions = int(num_orig)
 
     # —— 单步展开（左右2×3 → full）——
     def _expand_lr_to_full(self, a2x3: torch.Tensor, scale: float):
@@ -117,8 +112,17 @@ class MPCRunner:
         在当前 sim 初始状态上，对 H 步动作做在线优化（方案二）；
         返回 best_loss
         """
+        # ---- 抓初态快照 ----
+        x0_np = wp.to_torch(self.sim.wp_states[0].wp_x).detach().cpu().numpy()
+        v0_np = wp.to_torch(self.sim.wp_states[0].wp_v).detach().cpu().numpy()
+
         best = float("inf")
         for it in range(opts.max_iters):
+            # 每次迭代先恢复到初态
+            wp_x0 = wp.array(x0_np, dtype=wp.vec3f, device="cuda", requires_grad=True)
+            wp_v0 = wp.array(v0_np, dtype=wp.vec3f, device="cuda", requires_grad=True)
+            self.sim.set_init_state(wp_x0, wp_v0)
+
             # Tape 区：H 步可导 rollout
             with wp.Tape() as tape:
                 a_seq_wp = wp.from_torch(action.param, dtype=wp.vec3, requires_grad=True)
@@ -143,7 +147,11 @@ class MPCRunner:
                                                  action_seq_wp=a_seq_wp)
 
             # backward（到 warp）
-            tape.backward(self.sim.loss)
+            try:
+                tape.backward(self.sim.loss)
+            except Exception as e:
+                print(f"[MPC][it={it}] tape.backward error: {e}")
+                break
 
             # warp grad → torch grad
             action.param.grad = wp.to_torch(a_seq_wp.grad)
@@ -173,6 +181,50 @@ class MPCRunner:
             if curr < opts.early_tol:
                 print(f"[MPC] early stop at it={it}, loss={curr:.6f}")
                 break
+
+
+            # 读取 loss
+            curr = float(loss_t.detach().cpu())
+
+            # 打印 loss 与数值健康状况
+            if (it % 1) == 0:
+                x_last = wp.to_torch(self.sim.wp_states[-1].wp_x).detach()
+                nan_x = torch.isnan(x_last).any().item()
+                inf_x = torch.isinf(x_last).any().item()
+                g = action.param.grad
+                g_none = (g is None)
+                g_finite = (False if g_none else torch.isfinite(g).all().item())
+                g_norm = (0.0 if (g_none or not g_finite) else float(g.norm().detach().cpu()))
+                p_norm = float(action.param.detach().norm().cpu())
+                print(f"[MPC][it={it}] loss={curr:.6e} | grad_none={g_none} finite={g_finite} "
+                    f"| gnorm={g_norm:.3e} | |param|={p_norm:.3e} | x[nan]={nan_x} x[inf]={inf_x}")
+
+            # 如果 grad 是 None，进一步检查 a_seq_wp 是否 requires_grad、Tape 是否记录到了内核
+            if action.param.grad is None:
+                print(f"[MPC][it={it}] a_seq_wp.requires_grad={a_seq_wp.requires_grad}")
+                # 简单扰动参数做一次前向，验证 loss 是否变化（数值梯度探针）
+                with torch.no_grad():
+                    eps = 1e-3
+                    idx = 0
+                    action.param[idx, 0] += eps
+                    # 恢复初态
+                    self.sim.set_init_state(wp.array(x0_np, dtype=wp.vec3f, device='cuda', requires_grad=True),
+                                            wp.array(v0_np, dtype=wp.vec3f, device='cuda', requires_grad=True))
+                    df_list = []
+                    a_seq_wp2 = wp.from_torch(action.param, dtype=wp.vec3, requires_grad=False)
+                    for j in range(opts.horizon):
+                        dlr2 = wp.zeros(2, dtype=wp.vec3, device="cuda", requires_grad=False)
+                        wp.launch(self.sim.copy_row_vec3, dim=2, inputs=[a_seq_wp2, j, 2], outputs=[dlr2])
+                        df2 = wp.zeros(self.sim.num_control_points, dtype=wp.vec3, device="cuda", requires_grad=False)
+                        wp.launch(self.sim.expand_row2_squash_scale, dim=self.sim.num_control_points,
+                                inputs=[dlr2, self.left_wp_mask, self.right_wp_mask, float(opts.max_delta)], outputs=[df2])
+                        df_list.append(df2)
+                    self.sim.rollout(df_list)
+                    loss_probe = mpc_loss_shape_relative(self.sim, self.springs_wp, w_action=0.0, action_seq_wp=None)
+                    print(f"[MPC][it={it}] loss probe (param+eps) = {float(loss_probe.detach().cpu()):.6e}")
+                    # 撤销扰动
+                    action.param[idx, 0] -= eps
+
 
         return best
 

@@ -4,7 +4,7 @@ import os, pickle, glob, sys
 import open3d as o3d
 import numpy as np
 import warp as wp
-from sklearn.cluster import DBSCAN, KMeans
+from sklearn.cluster import KMeans
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # src/env/phystwin_env.py
 SRC_DIR      = PROJECT_ROOT / "src"
@@ -161,26 +161,21 @@ class PhysTwinEnv():
             self.simulator.wp_states[-1].wp_v,
         )
 
-    # Helper: Split ctrl_pts by DBSCAN
-    def split_ctrl_pts_dbscan(self, ctrl_pts: torch.Tensor):
-        clustering = DBSCAN(eps=0.05, min_samples=3).fit(ctrl_pts.cpu().numpy())
-        labels = clustering.labels_
+    def split_ctrl_pts_kmeans(self, ctrl_pts: torch.Tensor, n_ctrl_parts=2):
+        ctrl_np = ctrl_pts.detach().cpu().numpy()
+        kmeans = KMeans(n_clusters=n_ctrl_parts, random_state=0, n_init=10)
+        labels = kmeans.fit_predict(ctrl_np)
 
-        clusters = {}
-        for i in range(max(labels) + 1):
-            clusters[i] = np.where(labels == i)[0]
+        clusters = [np.where(labels == i)[0] for i in range(n_ctrl_parts)]
+        if len(clusters) != 2 or len(clusters[0]) == 0 or len(clusters[1]) == 0:
+            raise RuntimeError(f"KMeans failed: expected 2 clusters but got {len(clusters)}")
 
-        if len(clusters) != 2:
-            print(f"Warning: DBSCAN did not find exactly 2 clusters! Found {len(clusters)}")
-            return np.arange(15), np.arange(15, 30)  # half-half 
-
-        ctrl_np = ctrl_pts.cpu().numpy()
         c0_mean_x = ctrl_np[clusters[0], 0].mean()
         c1_mean_x = ctrl_np[clusters[1], 0].mean()
-
         if c0_mean_x < c1_mean_x:
             left_idx, right_idx = clusters[0], clusters[1]
         else:
             left_idx, right_idx = clusters[1], clusters[0]
-            
+
         return left_idx, right_idx
+    

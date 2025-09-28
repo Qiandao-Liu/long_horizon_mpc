@@ -21,7 +21,7 @@ if str(SRC_DIR) not in sys.path:
 if str(PHYSTWIN_DIR) not in sys.path:
     sys.path.insert(0, str(PHYSTWIN_DIR))
 
-from src.planning.gradient_core import MPCRunner, MPCOpts
+from src.planning.gradient_core import GradientCore, MPCOpts
 from src.planning.action_param import ActionParam, rowwise_normalized_step
 
 # ------------------------------ I/O helpers ------------------------------
@@ -52,8 +52,8 @@ class SegmentPlan:
     seg_id: int
     t_start: int
     t_goal: int
-    steps_required: int  # S
-    rounds: int          # R
+    steps_required: int
+    rounds: int
     last_exec_steps: int # 最后一轮实际执行的步数：min(H, S-(R-1))
 
 def build_segment_plans(milestones: List[int], frames_per_step: int, horizon: int) -> List[SegmentPlan]:
@@ -61,7 +61,7 @@ def build_segment_plans(milestones: List[int], frames_per_step: int, horizon: in
     for k in range(len(milestones) - 1):
         t0, t1 = milestones[k], milestones[k+1]
         delta = max(0, int(t1 - t0))
-        S = int(math.ceil(delta / float(frames_per_step)))  # 向上取整，保证到达
+        S = int(math.ceil(delta / float(frames_per_step)))
         if S <= 0:
             S = 1
         if S <= horizon:
@@ -81,15 +81,16 @@ def build_segment_plans(milestones: List[int], frames_per_step: int, horizon: in
 # ------------------------------ Demo frame → pkls ------------------------------
 
 def make_init_from_demo(demo: dict, t: int) -> dict:
-    """从 demo.pkl 的第 t 帧构造 init_pkl 形状"""
     wp_x = np.asarray(demo["wp_x_seq"][t], dtype=np.float32)
-    # 如果没有速度序列，就置零
-    if "wp_v_seq" in demo:
-        wp_v = np.asarray(demo["wp_v_seq"][t], dtype=np.float32)
-    else:
-        wp_v = np.zeros_like(wp_x, dtype=np.float32)
-    ctrl = np.asarray(demo["ctrl_seq"][t], dtype=np.float32)
-    springs = np.asarray(demo["spring_indices"], dtype=np.int32)
+    springs = np.asarray(demo["init_state"]["spring_indices"], dtype=np.int32)
+
+    # 初始速度固定为0
+    wp_v = np.zeros_like(wp_x, dtype=np.float32)
+
+    # 控制点：用该帧的 ctrl
+    if "ctrl_seq" in demo and len(demo["ctrl_seq"]) > t:
+        ctrl = np.asarray(demo["ctrl_seq"][t], dtype=np.float32)
+
     return {
         "wp_x": wp_x,
         "wp_v": wp_v,
@@ -98,32 +99,32 @@ def make_init_from_demo(demo: dict, t: int) -> dict:
     }
 
 def make_target_from_demo(demo: dict, t: int) -> dict:
-    """把第 t 帧位置当作目标（相对形状 loss 用边长，不关心绝对位姿）"""
+    """把第 t 帧位置当作目标"""
     return {"object_points": np.asarray(demo["wp_x_seq"][t], dtype=np.float32)}
 
 
 # ------------------------------ Execution helpers ------------------------------
 
-def _expand_lr_to_full(runner: MPCRunner, a2x3: torch.Tensor, scale: float):
-    """便捷封装：左右 2×3 → full 控制场（warp 数组）"""
+def _expand_lr_to_full(core: GradientCore, a2x3: torch.Tensor, scale: float):
+    """便捷封装：左右 2*3 → full 控制场"""
     a_wp = wp.from_torch(a2x3, dtype=wp.vec3, requires_grad=False)
-    dfull = wp.zeros(runner.sim.num_control_points, dtype=wp.vec3, device="cuda", requires_grad=False)
-    wp.launch(runner.sim.expand_row2_squash_scale, dim=runner.sim.num_control_points,
-              inputs=[a_wp, runner.left_wp_mask, runner.right_wp_mask, float(scale)], outputs=[dfull])
+    dfull = wp.zeros(core.sim.num_control_points, dtype=wp.vec3, device="cuda", requires_grad=False)
+    wp.launch(core.sim.expand_row2_squash_scale, dim=core.sim.num_control_points,
+              inputs=[a_wp, core.left_wp_mask, core.right_wp_mask, float(scale)], outputs=[dfull])
     return dfull
 
-def _execute_k_steps_and_record(runner: MPCRunner, action_param: torch.Tensor,
+def _execute_k_steps_and_record(core: GradientCore, action_param: torch.Tensor,
                                 k_steps: int, scale: float, record: bool):
-    """执行前 k_steps；若 record=True 则返回 frames 序列（含起点）"""
+    """执行前 k_steps, 若 record=True 则返回 frames 序列（含起点）"""
     frames = []
     if record:
-        frames.append(wp.to_torch(runner.sim.wp_states[-1].wp_x).detach().cpu().numpy())
+        frames.append(wp.to_torch(core.sim.wp_states[-1].wp_x).detach().cpu().numpy())
     for s in range(k_steps):
         a2 = action_param[2*s:2*s+2]
-        df = _expand_lr_to_full(runner, a2, scale)
-        runner.sim.one_step_from_action(df, is_first_step=(s == 0))
+        df = _expand_lr_to_full(core, a2, scale)
+        core.sim.one_step_from_action(df, is_first_step=(s == 0))
         if record:
-            frames.append(wp.to_torch(runner.sim.wp_states[-1].wp_x).detach().cpu().numpy())
+            frames.append(wp.to_torch(core.sim.wp_states[-1].wp_x).detach().cpu().numpy())
     return frames if record else None
 
 
@@ -149,8 +150,8 @@ def run_task_multiseg(task_name: str,
     for p in plans:
         print(f"  - seg{p.seg_id}: {p.t_start}->{p.t_goal} | steps S={p.steps_required} | rounds R={p.rounds} | last_exec={p.last_exec_steps}")
 
-    # Runner + 统一 opts
-    runner = MPCRunner(case_name=case_name, data_dir=DATA_DIR)
+    # core + 统一 opts
+    core = GradientCore(case_name=case_name, data_dir=DATA_DIR)
     opts = MPCOpts(
         horizon=horizon, max_iters=max_iters,
         max_delta=max_delta, step_row=step_row,
@@ -175,8 +176,8 @@ def run_task_multiseg(task_name: str,
         tgt_pkl  = make_target_from_demo(demo, plan.t_goal)
 
         # 放入 sim
-        runner.set_init_from_pkl(init_pkl)
-        runner.set_target_from_pkl(tgt_pkl)
+        core.set_init_from_pkl(init_pkl)
+        core.set_target_from_pkl(tgt_pkl)
 
         # 每轮在线优化
         remaining = plan.steps_required
@@ -186,40 +187,37 @@ def run_task_multiseg(task_name: str,
         for r in range(1, plan.rounds + 1):
             # 新建动作参数（H×），在线优化
             action = ActionParam(H=opts.horizon, device="cuda")
-            _ = runner.optimize_online(opts, action)
+            _ = core.optimize_online(opts, action)
 
             if r < plan.rounds:
                 # —— 非最后一轮：只执行 1 步 —— #
                 k = 1
-                frames = _execute_k_steps_and_record(runner, action.param.detach(), k_steps=k,
+                frames = _execute_k_steps_and_record(core, action.param.detach(), k_steps=k,
                                                      scale=opts.max_delta, record=False)
                 remaining -= k
 
                 # 记录动作（2×3）
                 seg_actions_2x3.append(action.param[:2].detach().cpu().numpy())
 
-                # Warm start 思想体现在下轮“重新优化”的初值；这里简单重来
                 # 更新 init：把当前 sim 的 -1 帧设置为下一轮起点
-                # （注意：set_init_from_pkl 会重置 wp_states，准备下一轮优化）
                 with torch.no_grad():
-                    wp_x = wp.to_torch(runner.sim.wp_states[-1].wp_x).detach().cpu().numpy()
-                    wp_v = wp.to_torch(runner.sim.wp_states[-1].wp_v).detach().cpu().numpy()
+                    wp_x = wp.to_torch(core.sim.wp_states[-1].wp_x).detach().cpu().numpy()
+                    wp_v = wp.to_torch(core.sim.wp_states[-1].wp_v).detach().cpu().numpy()
                 init_pkl = {
                     "wp_x": wp_x,
                     "wp_v": wp_v,
-                    "ctrl_pts": init_pkl["ctrl_pts"],  # 控制点原样即可（相对形状 loss 不依赖绝对位置）
+                    "ctrl_pts": init_pkl["ctrl_pts"],
                     "spring_indices": init_pkl["spring_indices"],
                 }
-                runner.set_init_from_pkl(init_pkl)  # 为下一轮优化准备
-                # 目标不变
-                runner.set_target_from_pkl(tgt_pkl)
+                core.set_init_from_pkl(init_pkl)
+                core.set_target_from_pkl(tgt_pkl)
 
             else:
                 # —— 最后一轮：执行 last_exec_steps（通常=H）并记录 —— #
                 k = int(plan.last_exec_steps)
                 # 将动作裁剪为前 k 步
                 act_k = action.param[:2*k].detach()
-                frames = _execute_k_steps_and_record(runner, act_k, k_steps=k,
+                frames = _execute_k_steps_and_record(core, act_k, k_steps=k,
                                                      scale=opts.max_delta, record=True)
                 remaining -= k
 
@@ -304,7 +302,6 @@ def main(task_name: str = "task11",
     )
 
 if __name__ == "__main__":
-    # 你也可以把这些参数做成 argparse；这里给一个默认可跑配置
     main(
         task_name="task11",
         case_name="double_lift_cloth_1",

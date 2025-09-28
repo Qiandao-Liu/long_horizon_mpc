@@ -47,6 +47,9 @@ class GradientCore:
         self.left_wp_mask = None
         self.right_wp_mask = None
 
+        # clean ctrl-pts
+        self._ctrl0_wp = None
+
         # 预备 springs（来自 init.pkl）
         self.springs_wp = None
 
@@ -59,6 +62,9 @@ class GradientCore:
         ctrl = torch.tensor(init_pkl["ctrl_pts"], dtype=torch.float32, device="cuda")
         self.sim.wp_original_control_point = wp.from_torch(ctrl, dtype=wp.vec3, requires_grad=False)
         self.sim.wp_target_control_point = wp.clone(self.sim.wp_original_control_point, requires_grad=True)
+
+        # 保存“初始控制点”的只读快照，供每个 it 复位
+        self._ctrl0_wp = wp.clone(self.sim.wp_original_control_point, requires_grad=False)
 
         # 弹簧
         springs_np = init_pkl.get("spring_indices", None)
@@ -151,6 +157,25 @@ class GradientCore:
             wp_v0 = wp.array(v0_np, dtype=wp.vec3f, device="cuda", requires_grad=True)
             self.sim.set_init_state(wp_x0, wp_v0)
 
+            # 还原控制点
+            # 1) 在 set_init_from_pkl(...) 里缓存一份 ctrl0
+            #    self._ctrl0_wp = wp.clone(self.sim.wp_original_control_point, requires_grad=False)
+            # 2) 每个 it 复位
+            self.sim.wp_original_control_point = wp.clone(self._ctrl0_wp, requires_grad=False)
+            self.sim.wp_target_control_point = wp.clone(self._ctrl0_wp,   requires_grad=True)
+
+            if getattr(self.sim, "object_collision_flag", False):
+                self.sim.update_collision_graph()
+
+            # 每轮迭代是否清理的检查
+            def _checksum(wp_arr):
+                t = wp.to_torch(wp_arr).detach()
+                return float(t.float().sum().cpu())
+            print("[CHK] it", it,
+                "x0=", _checksum(self.sim.wp_states[0].wp_x),
+                "v0=", _checksum(self.sim.wp_states[0].wp_v),
+                "ctrl_orig=", _checksum(self.sim.wp_original_control_point),
+                "ctrl_tgt=",  _checksum(self.sim.wp_target_control_point))
             # Tape 区：H 步可导 rollout
             with wp.Tape() as tape:
                 a_seq_wp = wp.from_torch(action.param, dtype=wp.vec3, requires_grad=True)
@@ -169,31 +194,32 @@ class GradientCore:
                 # rollout
                 self.sim.rollout(df_list)
 
-                # loss（相对几何）
+                # loss
                 loss_t = mpc_loss_shape_relative(self.sim, self.springs_wp,
                                                  w_action=opts.w_action,
                                                  action_seq_wp=a_seq_wp)
 
-            # backward（到 warp）
+            # backward
             try:
                 tape.backward(self.sim.loss)
             except Exception as e:
                 print(f"[MPC][it={it}] tape.backward error: {e}")
                 break
 
-            # warp grad → torch grad
-            action.param.grad = wp.to_torch(a_seq_wp.grad)
+            # warp -> torch grad
+            g = wp.to_torch(a_seq_wp.grad)
 
-            # 数值保护
-            if action.param.grad is None or not torch.isfinite(action.param.grad).all():
-                print(f"[MPC] grad invalid at it={it}, skip update")
+            if g is None:
+                print(f"[MPC] grad is None at it={it}")
             else:
-                # 行归一化步长
+                # ✅ 先净化，避免偶发 NaN/Inf 让你整轮 skip
+                g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # 赋给 param.grad 并更新
+                action.param.grad = g
                 rowwise_normalized_step(action.param, action.param.grad, opts.step_row)
-                # pre-tanh 限幅
                 action.clamp_pre_tanh_(opts.pre_tanh_clip)
-                # 清梯度
-                action.param.grad = None
+                action.param.grad = None  # 清梯度
 
             # 评估一次 loss（纯前向）
             with torch.no_grad():

@@ -3,19 +3,21 @@ import warp as wp
 import torch
 
 @wp.kernel(enable_backward=True)
-def edge_length_mse(
-    x_cur: wp.array(dtype=wp.vec3),              # 当前 cloth 粒子 [N]
-    x_tgt: wp.array(dtype=wp.vec3),              # 目标 cloth 粒子 [N]（与当前同拓扑索引）
-    springs: wp.array(dtype=wp.int32),           # [M,2] 的扁平化索引（i,j,i,j,...）
+def edge_length2_mse(
+    x_cur: wp.array(dtype=wp.vec3),
+    x_tgt: wp.array(dtype=wp.vec3),
+    springs: wp.array(dtype=wp.int32),
     invM: float,
-    out: wp.array(dtype=wp.float32),             # 标量
+    out: wp.array(dtype=wp.float32),
 ):
     k = wp.tid()
     i = springs[2*k + 0]
     j = springs[2*k + 1]
-    dij = wp.length(x_cur[i] - x_cur[j])
-    dij_t = wp.length(x_tgt[i] - x_tgt[j])
-    d = dij - dij_t
+    u  = x_cur[i] - x_cur[j]
+    ut = x_tgt[i] - x_tgt[j]
+    lij2  = wp.dot(u,  u)      # ||u||^2
+    ltij2 = wp.dot(ut, ut)     # ||ut||^2
+    d = lij2 - ltij2
     wp.atomic_add(out, 0, invM * d * d)
 
 @wp.kernel(enable_backward=True)
@@ -37,7 +39,7 @@ def mpc_loss_shape_relative(sim, springs_wp, w_action=0.0, action_seq_wp=None):
     M = springs_wp.shape[0] // 2
     invM = 1.0 / float(M)
     out = wp.zeros(1, dtype=wp.float32, device="cuda", requires_grad=True)
-    wp.launch(edge_length_mse, dim=M,
+    wp.launch(edge_length2_mse, dim=M,
               inputs=[sim.wp_states[-1].wp_x,
                       sim.wp_current_object_points,
                       springs_wp, invM],

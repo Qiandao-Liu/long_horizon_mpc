@@ -83,31 +83,29 @@ def build_segment_plans(milestones: List[int], frames_per_step: int, horizon: in
 def make_init_from_demo(demo: dict, t: int) -> dict:
     wp_x = np.asarray(demo["wp_x_seq"][t], dtype=np.float32)
     springs = np.asarray(demo["init_state"]["spring_indices"], dtype=np.int32)
-
-    # 初始速度固定为0
     wp_v = np.zeros_like(wp_x, dtype=np.float32)
-
-    # 控制点：用该帧的 ctrl
-    if "ctrl_seq" in demo and len(demo["ctrl_seq"]) > t:
-        ctrl = np.asarray(demo["ctrl_seq"][t], dtype=np.float32)
+    assert "ctrl_seq" in demo and len(demo["ctrl_seq"]) > t, "demo 缺少 ctrl_seq 或索引越界"
+    ctrl = np.asarray(demo["ctrl_seq"][t], dtype=np.float32)
 
     return {
         "wp_x": wp_x,
         "wp_v": wp_v,
         "ctrl_pts": ctrl,
         "spring_indices": springs,
+        "frame_index": int(t),
+        "origin": "init"
     }
 
 def make_target_from_demo(demo: dict, t: int) -> dict:
-    """把第 t 帧位置当作目标，同时也写入该帧 ctrl"""
     obj = np.asarray(demo["wp_x_seq"][t], dtype=np.float32)
     assert "ctrl_seq" in demo and len(demo["ctrl_seq"]) > t, "demo 缺少 ctrl_seq 或索引越界"
     ctrl = np.asarray(demo["ctrl_seq"][t], dtype=np.float32)
     return {
         "object_points": obj,
         "ctrl_pts": ctrl,
+        "frame_index": int(t),
+        "origin": "target"
     }
-
 
 # ------------------------------ Execution helpers ------------------------------
 
@@ -175,7 +173,7 @@ def run_task_multiseg(task_name: str,
 
     # —— 逐段执行 —— #
     for plan in plans:
-        print(f"\n[SEG{plan.seg_id}] start={plan.t_start} goal={plan.t_goal}  S={plan.steps_required}  R={plan.rounds}")
+        print(f"\n[SEG{plan.seg_id}] start={plan.t_start} goal={plan.t_goal}  Steps={plan.steps_required}  Rounds={plan.rounds}")
 
         # 段起点/目标
         init_pkl = make_init_from_demo(demo, plan.t_start)
@@ -185,11 +183,10 @@ def run_task_multiseg(task_name: str,
         core.set_init_from_pkl(init_pkl)
         core.set_target_from_pkl(tgt_pkl)
 
-        if plan.seg_id == 0:
-            try:
-                core.visualize_split_once(init_pkl, tgt_pkl)
-            except Exception as e:
-                print(f"[VIS] visualization failed: {e}")
+        # try:
+        #     core.visualize_split_once(init_pkl, tgt_pkl)
+        # except Exception as e:
+        #     print(f"[VIS] visualization failed: {e}")
 
         # 每轮在线优化
         remaining = plan.steps_required

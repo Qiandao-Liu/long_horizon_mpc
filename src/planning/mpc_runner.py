@@ -99,8 +99,14 @@ def make_init_from_demo(demo: dict, t: int) -> dict:
     }
 
 def make_target_from_demo(demo: dict, t: int) -> dict:
-    """把第 t 帧位置当作目标"""
-    return {"object_points": np.asarray(demo["wp_x_seq"][t], dtype=np.float32)}
+    """把第 t 帧位置当作目标，同时也写入该帧 ctrl"""
+    obj = np.asarray(demo["wp_x_seq"][t], dtype=np.float32)
+    assert "ctrl_seq" in demo and len(demo["ctrl_seq"]) > t, "demo 缺少 ctrl_seq 或索引越界"
+    ctrl = np.asarray(demo["ctrl_seq"][t], dtype=np.float32)
+    return {
+        "object_points": obj,
+        "ctrl_pts": ctrl,
+    }
 
 
 # ------------------------------ Execution helpers ------------------------------
@@ -178,6 +184,12 @@ def run_task_multiseg(task_name: str,
         # 放入 sim
         core.set_init_from_pkl(init_pkl)
         core.set_target_from_pkl(tgt_pkl)
+
+        if plan.seg_id == 0:
+            try:
+                core.visualize_split_once(init_pkl, tgt_pkl)
+            except Exception as e:
+                print(f"[VIS] visualization failed: {e}")
 
         # 每轮在线优化
         remaining = plan.steps_required

@@ -167,15 +167,15 @@ class PhysTwinEnv():
         labels = kmeans.fit_predict(ctrl_np)
 
         clusters = [np.where(labels == i)[0] for i in range(n_ctrl_parts)]
-        if len(clusters) != 2 or len(clusters[0]) == 0 or len(clusters[1]) == 0:
-            raise RuntimeError(f"KMeans failed: expected 2 clusters but got {len(clusters)}")
+        if len(clusters) != 2:
+            raise RuntimeError("KMeans failed: expected 2 clusters but got {len(clusters)}")
 
         c0_mean_x = ctrl_np[clusters[0], 0].mean()
         c1_mean_x = ctrl_np[clusters[1], 0].mean()
-        if c0_mean_x < c1_mean_x:
-            left_idx, right_idx = clusters[0], clusters[1]
-        else:
-            left_idx, right_idx = clusters[1], clusters[0]
+        left_idx, right_idx = (clusters[0], clusters[1]) if c0_mean_x < c1_mean_x else (clusters[1], clusters[0])
 
-        return left_idx, right_idx
-    
+        # 返回 torch.LongTensor
+        device = ctrl_pts.device
+        return (torch.as_tensor(left_idx, dtype=torch.long, device=device),
+                torch.as_tensor(right_idx, dtype=torch.long, device=device))
+        

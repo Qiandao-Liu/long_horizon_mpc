@@ -58,7 +58,7 @@ class GradientCore:
 
         ctrl = torch.tensor(init_pkl["ctrl_pts"], dtype=torch.float32, device="cuda")
         self.sim.wp_original_control_point = wp.from_torch(ctrl, dtype=wp.vec3, requires_grad=False)
-        self.sim.wp_target_control_point   = wp.clone(self.sim.wp_original_control_point, requires_grad=True)
+        self.sim.wp_target_control_point = wp.clone(self.sim.wp_original_control_point, requires_grad=True)
 
         # 弹簧
         springs_np = init_pkl.get("spring_indices", None)
@@ -68,9 +68,8 @@ class GradientCore:
 
         # —— 左右分组（使用真实 ctrl）——
         L, R = self.env.split_ctrl_pts_kmeans(ctrl)
-        if not isinstance(L, (list, tuple)) or len(L) == 0 or len(R) == 0:
+        if len(L) == 0 or len(R) == 0:
             raise RuntimeError("KMeans returned empty cluster(s)")
-
         self.left_idx, self.right_idx = L.detach().cpu().numpy(), R.detach().cpu().numpy()
 
         # 构建/更新 warp mask
@@ -80,6 +79,35 @@ class GradientCore:
         self.left_wp_mask  = wp.array(left_mask.detach().cpu().numpy(), dtype=wp.int32, device="cuda")
         self.right_wp_mask = wp.array(right_mask.detach().cpu().numpy(), dtype=wp.int32, device="cuda")
 
+    def visualize_split_once(self, init_pkl: dict, target_pkl: dict):
+        """在 set_init_from_pkl / set_target_from_pkl 之后调用，检查左右手"""
+        init_mass = init_pkl["wp_x"].astype(np.float32)
+        tgt_mass  = target_pkl["object_points"].astype(np.float32)
+        init_ctrl = init_pkl["ctrl_pts"].astype(np.float32)
+        tgt_ctrl  = target_pkl["ctrl_pts"].astype(np.float32)
+
+        # 目标帧也做一次 KMeans（可能手在另一侧）
+        L_tgt, R_tgt = self.env.split_ctrl_pts_kmeans(torch.from_numpy(tgt_ctrl).to("cuda"))
+        L_tgt = L_tgt.detach().cpu().numpy()
+        R_tgt = R_tgt.detach().cpu().numpy()
+
+        from src.vis.vis_ctrl_split import visualize_ctrl_and_mass_split
+        visualize_ctrl_and_mass_split(
+            init_mass=init_mass,
+            tgt_mass=tgt_mass,
+            init_ctrl=init_ctrl,
+            tgt_ctrl=tgt_ctrl,
+            left_idx_init=self.left_idx,
+            right_idx_init=self.right_idx,
+            left_idx_tgt=L_tgt,
+            right_idx_tgt=R_tgt,
+            z_lift_target=0.01,
+            bg_color="black",
+            mass_point_size=1.5, 
+            ctrl_radius=0.015, 
+            show_window=True,
+            save_path=None,
+        )
 
     def set_target_from_pkl(self, target_pkl: dict):
         target_gs = torch.tensor(target_pkl["object_points"], dtype=torch.float32, device="cuda")
@@ -94,7 +122,7 @@ class GradientCore:
         return dfull
 
     def _rollout_no_tape(self, action_seq: torch.Tensor, scale: float, record=False):
-        """纯前向 rollout H 步；可选记录状态"""
+        """纯前向 rollout H 步"""
         H = action_seq.shape[0] // 2
         frames = []
         if record:

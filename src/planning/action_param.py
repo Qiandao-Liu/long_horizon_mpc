@@ -27,7 +27,7 @@ class ActionParam:
                 self.param[:tail.shape[0]].copy_(tail)
 
 def rowwise_normalized_step(param: torch.Tensor, grad: torch.Tensor, step_row: float):
-    """每行固定步长的归一化梯度下降"""
+    """optimizer: 每行固定步长的归一化梯度下降"""
     with torch.no_grad():
         for r in range(param.shape[0]):
             g = grad[r]

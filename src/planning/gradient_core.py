@@ -176,50 +176,98 @@ class GradientCore:
                 "v0=", _checksum(self.sim.wp_states[0].wp_v),
                 "ctrl_orig=", _checksum(self.sim.wp_original_control_point),
                 "ctrl_tgt=",  _checksum(self.sim.wp_target_control_point))
+            
             # Tape 区：H 步可导 rollout
+            # with wp.Tape() as tape:
+            #     a_seq_wp = wp.from_torch(action.param, dtype=wp.vec3, requires_grad=True)
+
+            #     # 组装 H 步 full action
+            #     df_list = []
+            #     for j in range(opts.horizon):
+            #         dlr = wp.zeros(2, dtype=wp.vec3, device="cuda", requires_grad=True)
+            #         wp.launch(self.sim.copy_row_vec3, dim=2, inputs=[a_seq_wp, j, 2], outputs=[dlr])
+            #         df = wp.zeros(self.sim.num_control_points, dtype=wp.vec3, device="cuda", requires_grad=True)
+            #         wp.launch(self.sim.expand_row2_squash_scale, dim=self.sim.num_control_points,
+            #                   inputs=[dlr, self.left_wp_mask, self.right_wp_mask, float(opts.max_delta)],
+            #                   outputs=[df])
+            #         df_list.append(df)
+
+            #     # rollout
+            #     self.sim.rollout(df_list)
+
+            #     # loss
+            #     loss_t = mpc_loss_shape_relative(self.sim, self.springs_wp,
+            #                                      w_action=opts.w_action,
+            #                                      action_seq_wp=a_seq_wp)
             with wp.Tape() as tape:
                 a_seq_wp = wp.from_torch(action.param, dtype=wp.vec3, requires_grad=True)
 
-                # 组装 H 步 full action
+                with torch.no_grad():
+                    x_prev = wp.to_torch(self.sim.wp_states[0].wp_x).detach()
+
                 df_list = []
                 for j in range(opts.horizon):
                     dlr = wp.zeros(2, dtype=wp.vec3, device="cuda", requires_grad=True)
                     wp.launch(self.sim.copy_row_vec3, dim=2, inputs=[a_seq_wp, j, 2], outputs=[dlr])
                     df = wp.zeros(self.sim.num_control_points, dtype=wp.vec3, device="cuda", requires_grad=True)
                     wp.launch(self.sim.expand_row2_squash_scale, dim=self.sim.num_control_points,
-                              inputs=[dlr, self.left_wp_mask, self.right_wp_mask, float(opts.max_delta)],
-                              outputs=[df])
+                            inputs=[dlr, self.left_wp_mask, self.right_wp_mask, float(opts.max_delta)],
+                            outputs=[df])
                     df_list.append(df)
 
-                # rollout
-                self.sim.rollout(df_list)
+                #    Tape 内显式走每一步，保证捕获 kernel
+                for s, df in enumerate(df_list):
+                    self.sim.one_step_from_action(df, is_first_step=(s == 0))
 
-                # loss
                 loss_t = mpc_loss_shape_relative(self.sim, self.springs_wp,
-                                                 w_action=opts.w_action,
-                                                 action_seq_wp=a_seq_wp)
+                                                w_action=opts.w_action,
+                                                action_seq_wp=a_seq_wp)
+                
+                with torch.no_grad():
+                    x_now  = wp.to_torch(self.sim.wp_states[-1].wp_x).detach()
+                    disp   = (x_now - x_prev).norm(dim=1)
+                    print(f"[CHK] cloth Δ(mean)={float(disp.mean().cpu()):.3e} Δ(max)={float(disp.max().cpu()):.3e}")
 
-            # backward
+            LOSS_SCALE = 1e-6  # 先用 1e-6；若仍溢出就再小一阶
             try:
-                tape.backward(self.sim.loss)
+                tape.backward(self.sim.loss * LOSS_SCALE)  # 关键改动
             except Exception as e:
                 print(f"[MPC][it={it}] tape.backward error: {e}")
                 break
 
-            # warp -> torch grad
-            g = wp.to_torch(a_seq_wp.grad)
-
+            # 2) warp.grad -> torch 并净化
+            g = wp.to_torch(a_seq_wp.grad)          # g: [H*2, 3]
             if g is None:
-                print(f"[MPC] grad is None at it={it}")
+                g_none, g_finite, g_norm = True, False, 0.0
             else:
-                # ✅ 先净化，避免偶发 NaN/Inf 让你整轮 skip
                 g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+                g_none  = False
+                g_finite= bool(torch.isfinite(g).all())
+                g_norm  = float(g.norm().detach().cpu())
 
-                # 赋给 param.grad 并更新
+            # 3) 用 g 更新参数（你当前的“优化器”）
+            if not g_none:
                 action.param.grad = g
                 rowwise_normalized_step(action.param, action.param.grad, opts.step_row)
                 action.clamp_pre_tanh_(opts.pre_tanh_clip)
-                action.param.grad = None  # 清梯度
+                action.param.grad = None  # 现在才清
+
+            # 4) 打印（只用上面缓存到的 g_* 数）
+            p_norm = float(action.param.detach().norm().cpu())
+            x_last = wp.to_torch(self.sim.wp_states[-1].wp_x).detach()
+            nan_x = torch.isnan(x_last).any().item()
+            inf_x = torch.isinf(x_last).any().item()
+            curr = float(loss_t.detach().cpu())
+            print(f"[MPC][it={it}] loss={curr:.6e} | grad_none={g_none} finite={g_finite} "
+                f"| gnorm={g_norm:.3e} | |param|={p_norm:.3e} | x[nan]={nan_x} x[inf]={inf_x}")
+            
+            g_wp_norm = 0.0 if a_seq_wp.grad is None else float(wp.to_torch(a_seq_wp.grad).norm().detach().cpu())
+            print(f"[DBG] a_seq_wp.grad_norm={g_wp_norm:.3e}")
+
+
+            if curr < opts.early_tol:
+                print(f"[MPC] early stop at it={it}, loss={curr:.6f}")
+                break
 
             # 评估一次 loss（纯前向）
             with torch.no_grad():
@@ -227,58 +275,6 @@ class GradientCore:
                 # 简化处理：直接再 roll 一次（Tape 外）
                 # （更严谨可在进入 optimize_online 前抓一次 snapshot 并恢复）
                 pass
-
-            # 读取标量 loss
-            curr = float(loss_t.detach().cpu())
-            best = min(best, curr)
-
-            if curr < opts.early_tol:
-                print(f"[MPC] early stop at it={it}, loss={curr:.6f}")
-                break
-
-
-            # 读取 loss
-            curr = float(loss_t.detach().cpu())
-
-            # 打印 loss 与数值健康状况
-            if (it % 1) == 0:
-                x_last = wp.to_torch(self.sim.wp_states[-1].wp_x).detach()
-                nan_x = torch.isnan(x_last).any().item()
-                inf_x = torch.isinf(x_last).any().item()
-                g = action.param.grad
-                g_none = (g is None)
-                g_finite = (False if g_none else torch.isfinite(g).all().item())
-                g_norm = (0.0 if (g_none or not g_finite) else float(g.norm().detach().cpu()))
-                p_norm = float(action.param.detach().norm().cpu())
-                print(f"[MPC][it={it}] loss={curr:.6e} | grad_none={g_none} finite={g_finite} "
-                    f"| gnorm={g_norm:.3e} | |param|={p_norm:.3e} | x[nan]={nan_x} x[inf]={inf_x}")
-
-            # 如果 grad 是 None，进一步检查 a_seq_wp 是否 requires_grad、Tape 是否记录到了内核
-            if action.param.grad is None:
-                print(f"[MPC][it={it}] a_seq_wp.requires_grad={a_seq_wp.requires_grad}")
-                # 简单扰动参数做一次前向，验证 loss 是否变化（数值梯度探针）
-                with torch.no_grad():
-                    eps = 1e-3
-                    idx = 0
-                    action.param[idx, 0] += eps
-                    # 恢复初态
-                    self.sim.set_init_state(wp.array(x0_np, dtype=wp.vec3f, device='cuda', requires_grad=True),
-                                            wp.array(v0_np, dtype=wp.vec3f, device='cuda', requires_grad=True))
-                    df_list = []
-                    a_seq_wp2 = wp.from_torch(action.param, dtype=wp.vec3, requires_grad=False)
-                    for j in range(opts.horizon):
-                        dlr2 = wp.zeros(2, dtype=wp.vec3, device="cuda", requires_grad=False)
-                        wp.launch(self.sim.copy_row_vec3, dim=2, inputs=[a_seq_wp2, j, 2], outputs=[dlr2])
-                        df2 = wp.zeros(self.sim.num_control_points, dtype=wp.vec3, device="cuda", requires_grad=False)
-                        wp.launch(self.sim.expand_row2_squash_scale, dim=self.sim.num_control_points,
-                                inputs=[dlr2, self.left_wp_mask, self.right_wp_mask, float(opts.max_delta)], outputs=[df2])
-                        df_list.append(df2)
-                    self.sim.rollout(df_list)
-                    loss_probe = mpc_loss_shape_relative(self.sim, self.springs_wp, w_action=0.0, action_seq_wp=None)
-                    print(f"[MPC][it={it}] loss probe (param+eps) = {float(loss_probe.detach().cpu()):.6e}")
-                    # 撤销扰动
-                    action.param[idx, 0] -= eps
-
 
         return best
 

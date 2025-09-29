@@ -315,7 +315,7 @@ if __name__ == "__main__":
         task_name="task11",
         case_name="double_lift_cloth_1",
         frames_per_step=5,
-        horizon=10,
+        horizon=1,
         max_iters=30,
         max_delta=0.25,
         step_row=3e-2,

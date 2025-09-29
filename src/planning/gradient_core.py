@@ -228,9 +228,9 @@ class GradientCore:
                     disp   = (x_now - x_prev).norm(dim=1)
                     print(f"[CHK] cloth Δ(mean)={float(disp.mean().cpu()):.3e} Δ(max)={float(disp.max().cpu()):.3e}")
 
-            LOSS_SCALE = 1e-6  # 先用 1e-6；若仍溢出就再小一阶
+            # backward
             try:
-                tape.backward(self.sim.loss * LOSS_SCALE)  # 关键改动
+                tape.backward(self.sim.loss)
             except Exception as e:
                 print(f"[MPC][it={it}] tape.backward error: {e}")
                 break
@@ -255,9 +255,9 @@ class GradientCore:
             # 4) 打印（只用上面缓存到的 g_* 数）
             p_norm = float(action.param.detach().norm().cpu())
             x_last = wp.to_torch(self.sim.wp_states[-1].wp_x).detach()
-            nan_x = torch.isnan(x_last).any().item()
-            inf_x = torch.isinf(x_last).any().item()
-            curr = float(loss_t.detach().cpu())
+            nan_x  = torch.isnan(x_last).any().item()
+            inf_x  = torch.isinf(x_last).any().item()
+            curr   = float(loss_t.detach().cpu())
             print(f"[MPC][it={it}] loss={curr:.6e} | grad_none={g_none} finite={g_finite} "
                 f"| gnorm={g_norm:.3e} | |param|={p_norm:.3e} | x[nan]={nan_x} x[inf]={inf_x}")
             

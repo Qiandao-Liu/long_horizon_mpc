@@ -136,7 +136,7 @@ class GradientCore:
         for j in range(H):
             a2 = action_seq[2*j:2*j+2]
             df = self._expand_lr_to_full(a2, scale)
-            self.sim.one_step_from_action(df, is_first_step=(j==0))
+            self.sim.rollout(df)
             if record:
                 frames.append(wp.to_torch(self.sim.wp_states[-1].wp_x).detach().cpu().numpy())
         return frames if record else None
@@ -177,56 +177,28 @@ class GradientCore:
                 "ctrl_orig=", _checksum(self.sim.wp_original_control_point),
                 "ctrl_tgt=",  _checksum(self.sim.wp_target_control_point))
             
-            # Tape 区：H 步可导 rollout
-            # with wp.Tape() as tape:
-            #     a_seq_wp = wp.from_torch(action.param, dtype=wp.vec3, requires_grad=True)
 
-            #     # 组装 H 步 full action
-            #     df_list = []
-            #     for j in range(opts.horizon):
-            #         dlr = wp.zeros(2, dtype=wp.vec3, device="cuda", requires_grad=True)
-            #         wp.launch(self.sim.copy_row_vec3, dim=2, inputs=[a_seq_wp, j, 2], outputs=[dlr])
-            #         df = wp.zeros(self.sim.num_control_points, dtype=wp.vec3, device="cuda", requires_grad=True)
-            #         wp.launch(self.sim.expand_row2_squash_scale, dim=self.sim.num_control_points,
-            #                   inputs=[dlr, self.left_wp_mask, self.right_wp_mask, float(opts.max_delta)],
-            #                   outputs=[df])
-            #         df_list.append(df)
-
-            #     # rollout
-            #     self.sim.rollout(df_list)
-
-            #     # loss
-            #     loss_t = mpc_loss_shape_relative(self.sim, self.springs_wp,
-            #                                      w_action=opts.w_action,
-            #                                      action_seq_wp=a_seq_wp)
             with wp.Tape() as tape:
                 a_seq_wp = wp.from_torch(action.param, dtype=wp.vec3, requires_grad=True)
 
-                with torch.no_grad():
-                    x_prev = wp.to_torch(self.sim.wp_states[0].wp_x).detach()
-
+                # 组装 H 步 full action
                 df_list = []
                 for j in range(opts.horizon):
                     dlr = wp.zeros(2, dtype=wp.vec3, device="cuda", requires_grad=True)
                     wp.launch(self.sim.copy_row_vec3, dim=2, inputs=[a_seq_wp, j, 2], outputs=[dlr])
                     df = wp.zeros(self.sim.num_control_points, dtype=wp.vec3, device="cuda", requires_grad=True)
                     wp.launch(self.sim.expand_row2_squash_scale, dim=self.sim.num_control_points,
-                            inputs=[dlr, self.left_wp_mask, self.right_wp_mask, float(opts.max_delta)],
-                            outputs=[df])
+                              inputs=[dlr, self.left_wp_mask, self.right_wp_mask, float(opts.max_delta)],
+                              outputs=[df])
                     df_list.append(df)
 
-                #    Tape 内显式走每一步，保证捕获 kernel
-                for s, df in enumerate(df_list):
-                    self.sim.one_step_from_action(df, is_first_step=(s == 0))
+                # rollout
+                self.sim.rollout(df_list)
 
+                # loss
                 loss_t = mpc_loss_shape_relative(self.sim, self.springs_wp,
-                                                w_action=opts.w_action,
-                                                action_seq_wp=a_seq_wp)
-                
-                with torch.no_grad():
-                    x_now  = wp.to_torch(self.sim.wp_states[-1].wp_x).detach()
-                    disp   = (x_now - x_prev).norm(dim=1)
-                    print(f"[CHK] cloth Δ(mean)={float(disp.mean().cpu()):.3e} Δ(max)={float(disp.max().cpu()):.3e}")
+                                                 w_action=opts.w_action,
+                                                 action_seq_wp=a_seq_wp)
 
             # backward
             try:
@@ -281,10 +253,6 @@ class GradientCore:
     def run_segment(self, init_pkl: dict, target_pkl: dict,
                     opts: MPCOpts, exec_last_horizon: bool = True,
                     save_path: Path = None):
-        """
-        最小可用：在一个段上在线优化；非最后一轮由外层调用时只执行 1 步；
-        这里提供“执行整段 H 步并保存 rollout.pkl”的便捷接口（用于最后一轮）。
-        """
         # 写入 init / target
         self.set_init_from_pkl(init_pkl)
         self.set_target_from_pkl(target_pkl)

@@ -126,7 +126,7 @@ def _execute_k_steps_and_record(core: GradientCore, action_param: torch.Tensor,
     for s in range(k_steps):
         a2 = action_param[2*s:2*s+2]
         df = _expand_lr_to_full(core, a2, scale)
-        core.sim.one_step_from_action(df, is_first_step=(s == 0))
+        core.sim.rollout(df)
         if record:
             frames.append(wp.to_torch(core.sim.wp_states[-1].wp_x).detach().cpu().numpy())
     return frames if record else None
@@ -315,7 +315,7 @@ if __name__ == "__main__":
         task_name="task11",
         case_name="double_lift_cloth_1",
         frames_per_step=5,
-        horizon=1,
+        horizon=10,
         max_iters=30,
         max_delta=0.25,
         step_row=3e-2,

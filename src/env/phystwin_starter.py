@@ -90,11 +90,37 @@ class PhysTwinStarter():
         self.trainer = trainer
         self.simulator = trainer.simulator
 
+        # ===== 4. Info from Simulator
+        # 初始化控制点分组与局部坐标
+        ctrl_init = self.simulator.controller_points[0].detach().cpu().numpy()
+        self.left_idx, self.right_idx = self.split_ctrl_pts_kmeans(torch.from_numpy(ctrl_init))
+        self.prev_target = torch.from_numpy(ctrl_init).to(cfg.device)
+
+        # 记录局部坐标（初始化时 gripper pose 由 Isaac 第一次传入后再更新）
+        self.local_ctrl_left  = None
+        self.local_ctrl_right = None
+        self.current_target = self.prev_target.clone()
+
+
     def step(self, left_delta=None, right_delta=None):
         """
         推动一帧仿真。接受外部控制器输入（如 Isaac 双臂末端位姿变化），
         更新 simulator 的控制点并推进一步。
         """
+        # 将控制点目标传入 spring-mass 系统
+        self.simulator.set_controller_interactive(self.prev_target, self.current_target)
+
+        # 执行 Warp CUDA 计算图
+        wp.capture_launch(self.simulator.forward_graph)
+
+        # 准备下一帧初始状态
+        self.simulator.set_init_state(
+            self.simulator.wp_states[-1].wp_x,
+            self.simulator.wp_states[-1].wp_v
+        )
+
+        # 记录 prev_target
+        self.prev_target = self.current_target.clone()
 
     def get_state(self):
         """
@@ -105,20 +131,39 @@ class PhysTwinStarter():
         - gs_color (M,3): 颜色
         - ctrl_pts (K,3): 控制点位置
         """
+        wp_x = wp.to_torch(self.simulator.wp_states[-1].wp_x, requires_grad=False)
+        ctrl_pts = self.simulator.controller_points[0].detach().clone()
+
+        # Gaussian 信息
+        gs = self.trainer.gaussians
+        gs_xyz = gs.get_xyz.detach().clone()
+        gs_sigma = gs.get_scaling.detach().clone()
+        gs_color = gs.get_color.detach().clone()
+
+        return wp_x, gs_xyz, gs_sigma, gs_color, ctrl_pts
 
     def set_ctrl_from_robot(self, left_pose, right_pose):
         """
-        把 Isaac Sim 中的 gripper pose 映射到 controller_points
-        可使用 split_ctrl_pts_kmeans() 的左右索引。
+        将robot每一步移动的 moving delta 添加到控制点目前的pos上并更新
+        使用 split_ctrl_pts_kmeans() 的左右索引。
         """
+        ctrl_pts = self.current_target.clone()
 
-    def run(self, bridge=False, socket_port=None):
-        """
-        如果 bridge=False 则本地纯物理运行；
-        如果 bridge=True 则开启 socket 通信线程：
-            Isaac Sim ↔ PhysTwin
-        """
+        # 如果是第一次调用，保存局部坐标
+        if self.local_ctrl_left is None:
+            ctrl_np = ctrl_pts.detach().cpu().numpy()
+            self.local_ctrl_left  = (R_left.T @ (ctrl_np[self.left_idx]  - t_left).T).T
+            self.local_ctrl_right = (R_right.T @ (ctrl_np[self.right_idx] - t_right).T).T
 
+        # 应用刚体变换
+        left_world  = (R_left @ self.local_ctrl_left.T).T + t_left
+        right_world = (R_right @ self.local_ctrl_right.T).T + t_right
+
+        # 更新控制点
+        ctrl_pts[self.left_idx]  = torch.from_numpy(left_world).to(ctrl_pts.device, dtype=ctrl_pts.dtype)
+        ctrl_pts[self.right_idx] = torch.from_numpy(right_world).to(ctrl_pts.device, dtype=ctrl_pts.dtype)
+
+        self.current_target = ctrl_pts
 
     def split_ctrl_pts_kmeans(self, ctrl_pts: torch.Tensor, n_ctrl_parts=2):
         ctrl_np = ctrl_pts.detach().cpu().numpy()
@@ -137,7 +182,5 @@ class PhysTwinStarter():
         device = ctrl_pts.device
         return (torch.as_tensor(left_idx, dtype=torch.long, device=device),
                 torch.as_tensor(right_idx, dtype=torch.long, device=device))
-    
-    
-    
-        
+
+

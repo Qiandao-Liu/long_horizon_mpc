@@ -1,4 +1,4 @@
-# /src/env/phystwin_env.py
+# ./long_horizon_mpc/src/env/phystwin_starter.py
 import torch
 import os, pickle, glob, sys
 import open3d as o3d
@@ -6,7 +6,7 @@ import numpy as np
 import warp as wp
 from sklearn.cluster import KMeans
 from pathlib import Path
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # src/env/phystwin_env.py
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR      = PROJECT_ROOT / "src"
 PHYSTWIN_DIR = PROJECT_ROOT / "third_party" / "PhysTwinFork"
 DATA_DIR     = PROJECT_ROOT / "data"
@@ -41,7 +41,7 @@ class Timer:
         self.t0 = 0
         self.t1 = 0
 
-class PhysTwinEnv():
+class PhysTwinStarter():
     def __init__(self, 
                  case_name,
                  pure_inference_mode=True,
@@ -90,76 +90,35 @@ class PhysTwinEnv():
         self.trainer = trainer
         self.simulator = trainer.simulator
 
-        # ===== 4. Init Scenario =====
-        timer = Timer()
-        self.timer = timer
+    def step(self, left_delta=None, right_delta=None):
+        """
+        推动一帧仿真。接受外部控制器输入（如 Isaac 双臂末端位姿变化），
+        更新 simulator 的控制点并推进一步。
+        """
 
-        self.prev_target = self.simulator.controller_points[0].clone()
-        self.current_target = self.simulator.controller_points[0].clone()
-        self.prev_x = wp.to_torch(
-            self.simulator.wp_states[0].wp_x, requires_grad=False
-        ).clone()
-        self.masks_ctrl_pts = []
+    def get_state(self):
+        """
+        返回当前仿真状态，包括:
+        - wp_x (N,3): 物理节点位置
+        - gs_xyz (M,3): Gaussian 位置
+        - gs_sigma (M,): Gaussian 大小
+        - gs_color (M,3): 颜色
+        - ctrl_pts (K,3): 控制点位置
+        """
 
-        self.init_scenario(self.best_model_path)
+    def set_ctrl_from_robot(self, left_pose, right_pose):
+        """
+        把 Isaac Sim 中的 gripper pose 映射到 controller_points
+        可使用 split_ctrl_pts_kmeans() 的左右索引。
+        """
 
-    def init_scenario(self, best_model_path):
-        self.timer.start()
-        
-        logger.info(f"Load model from {best_model_path}")
-        checkpoint = torch.load(best_model_path, map_location=cfg.device)
+    def run(self, bridge=False, socket_port=None):
+        """
+        如果 bridge=False 则本地纯物理运行；
+        如果 bridge=True 则开启 socket 通信线程：
+            Isaac Sim ↔ PhysTwin
+        """
 
-        spring_Y = checkpoint["spring_Y"]
-        collide_elas = checkpoint["collide_elas"]
-        collide_fric = checkpoint["collide_fric"]
-        collide_object_elas = checkpoint["collide_object_elas"]
-        collide_object_fric = checkpoint["collide_object_fric"]
-        num_object_springs = checkpoint["num_object_springs"]
-
-        self.simulator.set_spring_Y(torch.log(spring_Y).detach().clone())
-        self.simulator.set_collide(
-            collide_elas.detach().clone(), collide_fric.detach().clone()
-        )
-        self.simulator.set_collide_object(
-            collide_object_elas.detach().clone(),
-            collide_object_fric.detach().clone(),
-        )
-        print(f"[init_scenario] Done in {self.timer.stop():.3f}s.")
-
-    # 在 PhysTwinEnv 里补：快照/恢复（在同一 sim 上高效复现一个状态）
-    def snapshot(self):
-        return {
-            "wp_x": wp.to_torch(self.simulator.wp_states[-1].wp_x, requires_grad=False).detach().cpu().numpy(),
-            "wp_v": wp.to_torch(self.simulator.wp_states[-1].wp_v, requires_grad=False).detach().cpu().numpy(),
-            "ctrl": self.simulator.controller_points[0].detach().cpu().numpy(),
-        }
-
-    def restore(self, snap: dict):
-        x = wp.array(snap["wp_x"], dtype=wp.vec3f, device="cuda")
-        v = wp.array(snap["wp_v"], dtype=wp.vec3f, device="cuda")
-        self.simulator.set_init_state(x, v)
-        ctrl = torch.tensor(snap["ctrl"], dtype=torch.float32, device="cuda")
-        self.simulator.controller_points[0].copy_(ctrl)
-
-    def set_ctrl_targets(self, left_target: torch.Tensor, right_target: torch.Tensor, left_idx, right_idx):
-        # 写入当前帧控制点目标（把两团控制点分别平移到期望位姿，可做 nearest/rigid 分配）
-        tgt = self.simulator.controller_points[0].clone()
-        tgt[left_idx]  = left_target
-        tgt[right_idx] = right_target
-        self.prev_target = self.current_target
-        self.current_target = tgt
-
-    def step_phys(self, is_first=False):
-        # 调用你在 playground 中的 forward（one_step_from_action / forward_graph）
-        self.simulator.set_controller_interactive(self.prev_target, self.current_target)
-        if self.simulator.object_collision_flag:
-            self.simulator.update_collision_graph()
-        wp.capture_launch(self.simulator.forward_graph)
-        # 将新状态作为下一步 init
-        self.simulator.set_init_state(
-            self.simulator.wp_states[-1].wp_x,
-            self.simulator.wp_states[-1].wp_v,
-        )
 
     def split_ctrl_pts_kmeans(self, ctrl_pts: torch.Tensor, n_ctrl_parts=2):
         ctrl_np = ctrl_pts.detach().cpu().numpy()
@@ -174,8 +133,11 @@ class PhysTwinEnv():
         c1_mean_x = ctrl_np[clusters[1], 0].mean()
         left_idx, right_idx = (clusters[0], clusters[1]) if c0_mean_x < c1_mean_x else (clusters[1], clusters[0])
 
-        # 返回 torch.LongTensor
+        # Return torch.LongTensor
         device = ctrl_pts.device
         return (torch.as_tensor(left_idx, dtype=torch.long, device=device),
                 torch.as_tensor(right_idx, dtype=torch.long, device=device))
+    
+    
+    
         

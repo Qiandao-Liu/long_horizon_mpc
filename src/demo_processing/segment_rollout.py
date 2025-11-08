@@ -14,7 +14,7 @@ DATA_DIR     = PROJECT_ROOT / "data"
 python -m src.demo_processing.segment_rollout
 """
 
-# 可选：图像调试
+# 图像调试
 try:
     import matplotlib.pyplot as plt
     _HAS_MPL = True

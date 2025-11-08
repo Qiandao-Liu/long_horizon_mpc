@@ -13,7 +13,7 @@ if str(SRC_DIR) not in sys.path:
 if str(PHYSTWIN_DIR) not in sys.path:
     sys.path.insert(0, str(PHYSTWIN_DIR))
 
-from src.env.phystwin_env import PhysTwinEnv
+from src.env.phystwin_starter import PhysTwinEnv
 
 @torch.no_grad()
 def _export_state_for_outer(sim):

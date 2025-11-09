@@ -101,12 +101,21 @@ class PhysTwinStarter():
         self.local_ctrl_right = None
         self.current_target = self.prev_target.clone()
 
+        # ===== 5. 加载 Gaussian Splatting 模型 =====
+        logger.info(f"Loading Gaussian model from {self.gaussians_path}")
+        self.gaussians = GaussianModel(sh_degree=3)
+        self.gaussians.load_ply(self.gaussians_path)
+        self.gaussians = remove_gaussians_with_low_opacity(self.gaussians, 0.1)
+        self.gaussians.isotropic = True
+
 
     def step(self, left_delta=None, right_delta=None):
         """
         推动一帧仿真。接受外部控制器输入（如 Isaac 双臂末端位姿变化），
         更新 simulator 的控制点并推进一步。
         """
+        logger.info("[PhysTwinStarter] stepping...")
+
         # 将控制点目标传入 spring-mass 系统
         self.simulator.set_controller_interactive(self.prev_target, self.current_target)
 
@@ -121,42 +130,54 @@ class PhysTwinStarter():
 
         # 记录 prev_target
         self.prev_target = self.current_target.clone()
+        logger.info("[PhysTwinStarter] step finished.")
+
 
     def get_state(self):
-        """
-        返回当前仿真状态，包括:
-        - wp_x (N,3): 物理节点位置
-        - gs_xyz (M,3): Gaussian 位置
-        - gs_sigma (M,): Gaussian 大小
-        - gs_color (M,3): 颜色
-        - ctrl_pts (K,3): 控制点位置
-        """
         wp_x = wp.to_torch(self.simulator.wp_states[-1].wp_x, requires_grad=False)
         ctrl_pts = self.simulator.controller_points[0].detach().clone()
 
         # Gaussian 信息
-        gs = self.trainer.gaussians
-        gs_xyz = gs.get_xyz.detach().clone()
+        gs = self.gaussians
+        gs_xyz   = gs.get_xyz.detach().clone()
         gs_sigma = gs.get_scaling.detach().clone()
-        gs_color = gs.get_color.detach().clone()
 
+        # === 获取颜色 ===
+        if hasattr(gs, "get_color"):
+            gs_color = gs.get_color.detach().clone()
+        elif hasattr(gs, "get_features_dc"):
+            # feature_dc 是 (N, SH_coeffs, 3)，只取 DC (base color)
+            features = gs.get_features_dc.detach().clone()
+            if features.shape[-1] == 3:
+                gs_color = torch.sigmoid(features)
+            else:
+                # fallback to gray
+                gs_color = torch.ones_like(gs_xyz) * 0.5
+        else:
+            gs_color = torch.ones_like(gs_xyz) * 0.5
+
+        logger.info(f"[PhysTwinStarter] wp_x={wp_x.shape}, gs={gs_xyz.shape}, ctrl={ctrl_pts.shape}")
         return wp_x, gs_xyz, gs_sigma, gs_color, ctrl_pts
 
     def set_ctrl_from_robot(self, left_pose, right_pose):
         """
-        将robot每一步移动的 moving delta 添加到控制点目前的pos上并更新
-        使用 split_ctrl_pts_kmeans() 的左右索引。
+        将 robot 每一步移动的末端位姿 (R, t) 应用到左右控制点簇。
+        left_pose / right_pose: dict with keys {"R": (3,3), "t": (3,)}
         """
         ctrl_pts = self.current_target.clone()
+
+        # 解析输入
+        R_left,  t_left  = np.array(left_pose["R"], dtype=np.float32),  np.array(left_pose["t"], dtype=np.float32)
+        R_right, t_right = np.array(right_pose["R"], dtype=np.float32), np.array(right_pose["t"], dtype=np.float32)
 
         # 如果是第一次调用，保存局部坐标
         if self.local_ctrl_left is None:
             ctrl_np = ctrl_pts.detach().cpu().numpy()
-            self.local_ctrl_left  = (R_left.T @ (ctrl_np[self.left_idx]  - t_left).T).T
+            self.local_ctrl_left  = (R_left.T  @ (ctrl_np[self.left_idx]  - t_left).T).T
             self.local_ctrl_right = (R_right.T @ (ctrl_np[self.right_idx] - t_right).T).T
 
         # 应用刚体变换
-        left_world  = (R_left @ self.local_ctrl_left.T).T + t_left
+        left_world  = (R_left  @ self.local_ctrl_left.T).T  + t_left
         right_world = (R_right @ self.local_ctrl_right.T).T + t_right
 
         # 更新控制点
